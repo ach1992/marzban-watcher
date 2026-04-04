@@ -201,17 +201,6 @@ marzban-watcher reconfigure
 
 ---
 
-## Quick GitHub upload
-
-```bash
-git init
-git branch -M main
-git add .
-git commit -m "Initial release of Marzban Watcher"
-git remote add origin https://github.com/ach1992/marzban-watcher.git
-git push -u origin main
-```
-
 
 ## Notes
 

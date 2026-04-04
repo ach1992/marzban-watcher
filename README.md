@@ -29,7 +29,7 @@ marzwatch
 
 ## Important note about Base URL
 
-Use your panel base URL **without** `/hpanel`.
+Use your panel base URL **without** `/path`.
 
 Correct:
 
@@ -40,7 +40,7 @@ https://panel.example.com:8443
 Wrong:
 
 ```bash
-https://panel.example.com:8443/hpanel/
+https://panel.example.com:8443/path/
 ```
 
 ---
@@ -204,7 +204,7 @@ marzban-watcher reconfigure
 
 ## Notes
 
-- `BASE_URL` must be entered **without** `/hpanel`.
+- `BASE_URL` must be entered **without** `/path`.
 - The installer and `reconfigure` now sanitize credentials to a single line to avoid broken `ADMIN_PASS` values in the env file.
 - Live output is sorted by **unique IP count descending**, then **connection count descending**, then username.
 - `LIVE_TOP` controls how many rows are shown in the live report. Default: `50`.

@@ -31,6 +31,10 @@ ensure_root() {
   fi
 }
 
+sanitize_single_line() {
+  printf '%s' "$1" | tr -d '\r\n'
+}
+
 show_latest() {
   if [[ -f "$LATEST_FILE" ]]; then
     cat "$LATEST_FILE"
@@ -77,11 +81,11 @@ reconfigure() {
   BASE_URL="$(printf '%s' "$BASE_URL" | sed -E 's#/[Hh][Pp][Aa][Nn][Ee][Ll]/?$##; s#/$##')"
 
   read -r -p "Admin username [$ADMIN_USER]: " input
-  [[ -n "$input" ]] && ADMIN_USER="$input"
+  [[ -n "$input" ]] && ADMIN_USER="$(sanitize_single_line "$input")"
 
   read -r -s -p "Admin password [hidden, enter to keep current]: " input
   echo
-  [[ -n "$input" ]] && ADMIN_PASS="$input"
+  [[ -n "$input" ]] && ADMIN_PASS="$(sanitize_single_line "$input")"
 
   read -r -p "Refresh seconds [$REFRESH]: " input
   [[ -n "$input" ]] && REFRESH="$input"
@@ -91,6 +95,9 @@ reconfigure() {
   [[ -n "$input" ]] && LIVE_IP_LIMIT="$input"
   read -r -p "Live connection limit [$LIVE_CONN_LIMIT]: " input
   [[ -n "$input" ]] && LIVE_CONN_LIMIT="$input"
+  LIVE_TOP="${LIVE_TOP:-50}"
+  read -r -p "Max rows in live report [$LIVE_TOP]: " input
+  [[ -n "$input" ]] && LIVE_TOP="$input"
   read -r -p "Hourly window [$HOURLY_WINDOW]: " input
   [[ -n "$input" ]] && HOURLY_WINDOW="$input"
   read -r -p "Hourly IP limit [$HOURLY_IP_LIMIT]: " input
@@ -99,17 +106,18 @@ reconfigure() {
   [[ -n "$input" ]] && HOURLY_CONN_LIMIT="$input"
 
   cat > "$ENV_FILE" <<EOF
-BASE_URL=$BASE_URL
-ADMIN_USER=$ADMIN_USER
-ADMIN_PASS=$ADMIN_PASS
-REFRESH=$REFRESH
-LIVE_WINDOW=$LIVE_WINDOW
-LIVE_IP_LIMIT=$LIVE_IP_LIMIT
-LIVE_CONN_LIMIT=$LIVE_CONN_LIMIT
-HOURLY_WINDOW=$HOURLY_WINDOW
-HOURLY_IP_LIMIT=$HOURLY_IP_LIMIT
-HOURLY_CONN_LIMIT=$HOURLY_CONN_LIMIT
-INSECURE=${INSECURE:-}
+BASE_URL=$(sanitize_single_line "$BASE_URL")
+ADMIN_USER=$(sanitize_single_line "$ADMIN_USER")
+ADMIN_PASS=$(sanitize_single_line "$ADMIN_PASS")
+REFRESH=$(sanitize_single_line "$REFRESH")
+LIVE_WINDOW=$(sanitize_single_line "$LIVE_WINDOW")
+LIVE_IP_LIMIT=$(sanitize_single_line "$LIVE_IP_LIMIT")
+LIVE_CONN_LIMIT=$(sanitize_single_line "$LIVE_CONN_LIMIT")
+LIVE_TOP=$(sanitize_single_line "${LIVE_TOP:-50}")
+HOURLY_WINDOW=$(sanitize_single_line "$HOURLY_WINDOW")
+HOURLY_IP_LIMIT=$(sanitize_single_line "$HOURLY_IP_LIMIT")
+HOURLY_CONN_LIMIT=$(sanitize_single_line "$HOURLY_CONN_LIMIT")
+INSECURE=$(sanitize_single_line "${INSECURE:-}")
 EOF
   chmod 600 "$ENV_FILE"
   systemctl restart "$SERVICE"

@@ -199,4 +199,23 @@ journalctl -u marzban-watcher -n 100 --no-pager
 marzban-watcher reconfigure
 ```
 
+---
 
+## Quick GitHub upload
+
+```bash
+git init
+git branch -M main
+git add .
+git commit -m "Initial release of Marzban Watcher"
+git remote add origin https://github.com/ach1992/marzban-watcher.git
+git push -u origin main
+```
+
+
+## Notes
+
+- `BASE_URL` must be entered **without** `/hpanel`.
+- The installer and `reconfigure` now sanitize credentials to a single line to avoid broken `ADMIN_PASS` values in the env file.
+- Live output is sorted by **unique IP count descending**, then **connection count descending**, then username.
+- `LIVE_TOP` controls how many rows are shown in the live report. Default: `50`.

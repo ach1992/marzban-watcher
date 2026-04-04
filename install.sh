@@ -71,6 +71,19 @@ ask_secret() {
   printf '%s' "$var"
 }
 
+sanitize_single_line() {
+  printf '%s' "$1" | tr -d '\r\n'
+}
+
+require_nonempty() {
+  local name="$1"
+  local value="$2"
+  if [[ -z "$value" ]]; then
+    echo "[ERROR] $name cannot be empty."
+    exit 1
+  fi
+}
+
 normalize_base_url() {
   printf '%s' "$1" | sed -E 's#/[Hh][Pp][Aa][Nn][Ee][Ll]/?$##; s#/$##'
 }
@@ -87,17 +100,18 @@ fetch_or_copy() {
 
 write_env() {
   cat > "$ENV_FILE" <<EOF
-BASE_URL=$BASE_URL
-ADMIN_USER=$ADMIN_USER
-ADMIN_PASS=$ADMIN_PASS
-REFRESH=$REFRESH
-LIVE_WINDOW=$LIVE_WINDOW
-LIVE_IP_LIMIT=$LIVE_IP_LIMIT
-LIVE_CONN_LIMIT=$LIVE_CONN_LIMIT
-HOURLY_WINDOW=$HOURLY_WINDOW
-HOURLY_IP_LIMIT=$HOURLY_IP_LIMIT
-HOURLY_CONN_LIMIT=$HOURLY_CONN_LIMIT
-INSECURE=$INSECURE
+BASE_URL=$(sanitize_single_line "$BASE_URL")
+ADMIN_USER=$(sanitize_single_line "$ADMIN_USER")
+ADMIN_PASS=$(sanitize_single_line "$ADMIN_PASS")
+REFRESH=$(sanitize_single_line "$REFRESH")
+LIVE_WINDOW=$(sanitize_single_line "$LIVE_WINDOW")
+LIVE_IP_LIMIT=$(sanitize_single_line "$LIVE_IP_LIMIT")
+LIVE_CONN_LIMIT=$(sanitize_single_line "$LIVE_CONN_LIMIT")
+LIVE_TOP=$(sanitize_single_line "$LIVE_TOP")
+HOURLY_WINDOW=$(sanitize_single_line "$HOURLY_WINDOW")
+HOURLY_IP_LIMIT=$(sanitize_single_line "$HOURLY_IP_LIMIT")
+HOURLY_CONN_LIMIT=$(sanitize_single_line "$HOURLY_CONN_LIMIT")
+INSECURE=$(sanitize_single_line "$INSECURE")
 EOF
   chmod 600 "$ENV_FILE"
 }
@@ -112,12 +126,15 @@ main() {
   echo
   BASE_URL="$(ask_default 'Base URL (do not include /hpanel)' 'https://panel.example.com:8443')"
   BASE_URL="$(normalize_base_url "$BASE_URL")"
-  ADMIN_USER="$(ask_default 'Admin username' 'admin')"
-  ADMIN_PASS="$(ask_secret 'Admin password')"
+  ADMIN_USER="$(sanitize_single_line "$(ask_default 'Admin username' 'admin')")"
+  ADMIN_PASS="$(sanitize_single_line "$(ask_secret 'Admin password')")"
+  require_nonempty 'Admin username' "$ADMIN_USER"
+  require_nonempty 'Admin password' "$ADMIN_PASS"
   REFRESH="$(ask_default 'Refresh seconds' '10')"
   LIVE_WINDOW="$(ask_default 'Live window seconds' '300')"
   LIVE_IP_LIMIT="$(ask_default 'Live unique IP limit' '3')"
   LIVE_CONN_LIMIT="$(ask_default 'Live connection limit' '40')"
+  LIVE_TOP="$(ask_default 'Max rows in live report' '50')"
   HOURLY_WINDOW="$(ask_default 'Hourly window seconds' '3600')"
   HOURLY_IP_LIMIT="$(ask_default 'Hourly unique IP limit' '4')"
   HOURLY_CONN_LIMIT="$(ask_default 'Hourly connection limit' '250')"
@@ -149,6 +166,13 @@ main() {
   systemctl daemon-reload
   systemctl enable --now marzban-watcher
   systemctl restart marzban-watcher
+  sleep 3
+  if ! systemctl is-active --quiet marzban-watcher; then
+    echo "[ERROR] Service did not start successfully."
+    echo "[ERROR] Check: systemctl status marzban-watcher --no-pager -l"
+    echo "[ERROR] Check: tail -n 100 /var/log/marzban-watcher.stderr.log"
+    exit 1
+  fi
 
   echo
   echo "[OK] Marzban Watcher installed successfully."

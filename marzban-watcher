@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP="Marzban Watcher"
+SERVICE="marzban-watcher"
+ENV_FILE="/etc/marzban-watcher.env"
+LATEST_FILE="/var/lib/marzban-watcher/latest_report.txt"
+HOURLY_FILE="/var/lib/marzban-watcher/hourly_suspicious.jsonl"
+STDOUT_LOG="/var/log/marzban-watcher.stdout.log"
+STDERR_LOG="/var/log/marzban-watcher.stderr.log"
+INSTALL_DIR="/opt/marzban-watcher"
+UNINSTALL_SCRIPT="$INSTALL_DIR/uninstall.sh"
+
+banner() {
+  clear 2>/dev/null || true
+  cat <<'EOF'
+============================================================
+ __  __                     _                     __        __    _       _
+|  \/  | __ _ _ __ ______ _| |__   __ _ _ __      \ \      / /_ _| |_ ___| |__   ___ _ __
+| |\/| |/ _` | '__|_  / _` | '_ \ / _` | '_ \      \ \ /\ / / _` | __/ __| '_ \ / _ \ '__|
+| |  | | (_| | |   / / (_| | |_) | (_| | | | |      \ V  V / (_| | || (__| | | |  __/ |
+|_|  |_|\__,_|_|  /___\__,_|_.__/ \__,_|_| |_|       \_/\_/ \__,_|\__\___|_| |_|\___|_|
+============================================================
+EOF
+}
+
+ensure_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    echo "Please run as root."
+    exit 1
+  fi
+}
+
+show_latest() {
+  if [[ -f "$LATEST_FILE" ]]; then
+    cat "$LATEST_FILE"
+  else
+    echo "No latest report found yet."
+  fi
+}
+
+show_hourly() {
+  if [[ -f "$HOURLY_FILE" ]]; then
+    tail -n 50 "$HOURLY_FILE"
+  else
+    echo "No hourly archive found yet."
+  fi
+}
+
+show_logs() {
+  touch "$STDOUT_LOG" "$STDERR_LOG"
+  tail -f "$STDOUT_LOG" "$STDERR_LOG"
+}
+
+live_watch() {
+  watch -n 2 "cat '$LATEST_FILE' 2>/dev/null || echo 'No latest report found yet.'"
+}
+
+service_action() {
+  local action="$1"
+  systemctl "$action" "$SERVICE"
+  systemctl status "$SERVICE" --no-pager -l || true
+}
+
+reconfigure() {
+  ensure_root
+  if [[ ! -f "$ENV_FILE" ]]; then
+    echo "Env file not found: $ENV_FILE"
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+
+  local input
+  read -r -p "Base URL [$BASE_URL]: " input
+  [[ -n "$input" ]] && BASE_URL="$input"
+  BASE_URL="$(printf '%s' "$BASE_URL" | sed -E 's#/[Hh][Pp][Aa][Nn][Ee][Ll]/?$##; s#/$##')"
+
+  read -r -p "Admin username [$ADMIN_USER]: " input
+  [[ -n "$input" ]] && ADMIN_USER="$input"
+
+  read -r -s -p "Admin password [hidden, enter to keep current]: " input
+  echo
+  [[ -n "$input" ]] && ADMIN_PASS="$input"
+
+  read -r -p "Refresh seconds [$REFRESH]: " input
+  [[ -n "$input" ]] && REFRESH="$input"
+  read -r -p "Live window [$LIVE_WINDOW]: " input
+  [[ -n "$input" ]] && LIVE_WINDOW="$input"
+  read -r -p "Live IP limit [$LIVE_IP_LIMIT]: " input
+  [[ -n "$input" ]] && LIVE_IP_LIMIT="$input"
+  read -r -p "Live connection limit [$LIVE_CONN_LIMIT]: " input
+  [[ -n "$input" ]] && LIVE_CONN_LIMIT="$input"
+  read -r -p "Hourly window [$HOURLY_WINDOW]: " input
+  [[ -n "$input" ]] && HOURLY_WINDOW="$input"
+  read -r -p "Hourly IP limit [$HOURLY_IP_LIMIT]: " input
+  [[ -n "$input" ]] && HOURLY_IP_LIMIT="$input"
+  read -r -p "Hourly connection limit [$HOURLY_CONN_LIMIT]: " input
+  [[ -n "$input" ]] && HOURLY_CONN_LIMIT="$input"
+
+  cat > "$ENV_FILE" <<EOF
+BASE_URL=$BASE_URL
+ADMIN_USER=$ADMIN_USER
+ADMIN_PASS=$ADMIN_PASS
+REFRESH=$REFRESH
+LIVE_WINDOW=$LIVE_WINDOW
+LIVE_IP_LIMIT=$LIVE_IP_LIMIT
+LIVE_CONN_LIMIT=$LIVE_CONN_LIMIT
+HOURLY_WINDOW=$HOURLY_WINDOW
+HOURLY_IP_LIMIT=$HOURLY_IP_LIMIT
+HOURLY_CONN_LIMIT=$HOURLY_CONN_LIMIT
+INSECURE=${INSECURE:-}
+EOF
+  chmod 600 "$ENV_FILE"
+  systemctl restart "$SERVICE"
+  echo "Configuration updated and service restarted."
+}
+
+menu() {
+  while true; do
+    banner
+    echo "1) Live"
+    echo "2) Latest"
+    echo "3) Hourly"
+    echo "4) Logs"
+    echo "5) Status"
+    echo "6) Reconfigure"
+    echo "7) Start"
+    echo "8) Stop"
+    echo "9) Restart"
+    echo "10) Uninstall"
+    echo "0) Exit"
+    echo
+    read -r -p "Select an option: " choice
+    case "$choice" in
+      1) live_watch ;;
+      2) show_latest ;;
+      3) show_hourly ;;
+      4) show_logs ;;
+      5) systemctl status "$SERVICE" --no-pager -l || true ;;
+      6) reconfigure ;;
+      7) ensure_root; service_action start ;;
+      8) ensure_root; service_action stop ;;
+      9) ensure_root; service_action restart ;;
+      10)
+        ensure_root
+        if [[ -x "$UNINSTALL_SCRIPT" ]]; then
+          "$UNINSTALL_SCRIPT"
+        else
+          echo "Uninstall script not found: $UNINSTALL_SCRIPT"
+          exit 1
+        fi
+        ;;
+      0) exit 0 ;;
+      *) echo "Invalid choice." ;;
+    esac
+    echo
+    read -r -p "Press Enter to continue..." _
+  done
+}
+
+cmd="${1:-menu}"
+case "$cmd" in
+  menu) menu ;;
+  live) live_watch ;;
+  latest) show_latest ;;
+  hourly) show_hourly ;;
+  logs) show_logs ;;
+  start|stop|restart)
+    ensure_root
+    service_action "$cmd"
+    ;;
+  status)
+    systemctl status "$SERVICE" --no-pager -l || true
+    ;;
+  reconfigure)
+    reconfigure
+    ;;
+  uninstall)
+    ensure_root
+    "$UNINSTALL_SCRIPT"
+    ;;
+  *)
+    echo "Usage: marzban-watcher {menu|live|latest|hourly|logs|status|reconfigure|start|stop|restart|uninstall}"
+    exit 1
+    ;;
+esac

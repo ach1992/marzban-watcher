@@ -1,0 +1,19 @@
+[Unit]
+Description=Marzban Watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/marzban-watcher.env
+ExecStart=/bin/bash -lc '/opt/marzban-watcher/.venv/bin/python /opt/marzban-watcher/marzban_watch.py --base-url "$BASE_URL" --username "$ADMIN_USER" --password "$ADMIN_PASS" --refresh "$REFRESH" --live-window "$LIVE_WINDOW" --live-ip-limit "$LIVE_IP_LIMIT" --live-conn-limit "$LIVE_CONN_LIMIT" --hourly-window "$HOURLY_WINDOW" --hourly-ip-limit "$HOURLY_IP_LIMIT" --hourly-conn-limit "$HOURLY_CONN_LIMIT" ${INSECURE:+--insecure}'
+Restart=always
+RestartSec=3
+User=root
+Group=root
+WorkingDirectory=/opt/marzban-watcher
+StandardOutput=append:/var/log/marzban-watcher.stdout.log
+StandardError=append:/var/log/marzban-watcher.stderr.log
+
+[Install]
+WantedBy=multi-user.target

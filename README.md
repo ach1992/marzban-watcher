@@ -2,10 +2,6 @@
 
 Live suspicious usage watcher for Marzban with interactive install, online one-liner setup, offline install, simple menu, reconfigure support, logs, and uninstall.
 
-Repository:
-- Name: **Marzban Watcher**
-- URL: `https://github.com/ach1992/marzban-watcher`
-
 ## What it does
 
 - Connects to Marzban core logs and node logs through official API and websocket endpoints.

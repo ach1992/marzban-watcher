@@ -14,7 +14,6 @@ import os
 import re
 import signal
 import ssl
-import sys
 import threading
 import time
 import traceback
@@ -36,6 +35,7 @@ DEFAULT_LOG_BACKUPS = 3
 DEFAULT_HISTORY_MAX_MB = 512
 DEFAULT_RECONNECT_MAX_DELAY = 60
 DEFAULT_LOG_REPEAT_SECONDS = 300
+DEFAULT_STATS_MAX_BUCKETS = 300
 
 
 def join_path(*parts: str) -> str:
@@ -186,65 +186,135 @@ def parse_log_line(line: str):
         return None
 
 
-class RollingStats:
-    def __init__(self, max_window_seconds: int):
-        self.max_window = max_window_seconds
-        self.events = deque()
+class RollingWindowState:
+    def __init__(self, window_seconds: int, max_buckets: int):
+        self.window_seconds = window_seconds
+        self.bucket_seconds = max(1.0, window_seconds / max_buckets)
+        self.buckets = deque()
+        self.current_bucket_id = None
+        self.current_bucket = None
         self.conn_count = Counter()
         self.user_ip_counter = defaultdict(Counter)
         self.user_source_counter = defaultdict(Counter)
+
+
+class RollingStats:
+    """Rolling counters with adaptive time buckets.
+
+    Each configured window keeps at most roughly ``max_buckets`` time buckets.
+    A bucket aggregates connection counts per user, IP, and source, so memory
+    scales with distinct identities in a bounded number of time slices rather
+    than with every raw connection event. Window boundaries are quantized by at
+    most one bucket (default: about 0.33% of each window).
+    """
+
+    def __init__(self, window_seconds, max_buckets: int = DEFAULT_STATS_MAX_BUCKETS):
+        if isinstance(window_seconds, int):
+            windows = [window_seconds]
+        else:
+            windows = list(window_seconds)
+        windows = sorted(set(int(window) for window in windows))
+        if not windows or any(window <= 0 for window in windows):
+            raise ValueError('rolling windows must be positive integers')
+        if max_buckets <= 0:
+            raise ValueError('max_buckets must be greater than zero')
+
+        self.max_buckets = int(max_buckets)
+        self.states = {
+            window: RollingWindowState(window, self.max_buckets)
+            for window in windows
+        }
         self.lock = threading.Lock()
 
-    def _cleanup(self, now_ts: float):
-        cutoff = now_ts - self.max_window
-        while self.events and self.events[0][0] < cutoff:
-            _, username, ip, source_name = self.events.popleft()
-            self.conn_count[username] -= 1
-            if self.conn_count[username] <= 0:
-                self.conn_count.pop(username, None)
-            self.user_ip_counter[username][ip] -= 1
-            if self.user_ip_counter[username][ip] <= 0:
-                self.user_ip_counter[username].pop(ip, None)
-            if not self.user_ip_counter[username]:
-                self.user_ip_counter.pop(username, None)
-            self.user_source_counter[username][source_name] -= 1
-            if self.user_source_counter[username][source_name] <= 0:
-                self.user_source_counter[username].pop(source_name, None)
-            if not self.user_source_counter[username]:
-                self.user_source_counter.pop(username, None)
+    @staticmethod
+    def _decrement(counter: Counter, key, amount: int) -> None:
+        remaining = counter.get(key, 0) - amount
+        if remaining > 0:
+            counter[key] = remaining
+        else:
+            counter.pop(key, None)
 
-    def add(self, username: str, ip: str, source_name: str):
-        now_ts = time.time()
-        with self.lock:
-            self.events.append((now_ts, username, ip, source_name))
-            self.conn_count[username] += 1
-            self.user_ip_counter[username][ip] += 1
-            self.user_source_counter[username][source_name] += 1
-            self._cleanup(now_ts)
+    def _remove_bucket(self, state: RollingWindowState, bucket) -> None:
+        _, conn_count, user_ip_counter, user_source_counter = bucket
 
-    def snapshot(self, window_seconds: int):
-        now_ts = time.time()
-        cutoff = now_ts - window_seconds
-        result_conn = Counter()
-        result_ip = defaultdict(Counter)
-        result_source = defaultdict(Counter)
+        for username, amount in conn_count.items():
+            self._decrement(state.conn_count, username, amount)
+
+        for username, ip_counts in user_ip_counter.items():
+            state_ip_counts = state.user_ip_counter.get(username)
+            if state_ip_counts is None:
+                continue
+            for ip, amount in ip_counts.items():
+                self._decrement(state_ip_counts, ip, amount)
+            if not state_ip_counts:
+                state.user_ip_counter.pop(username, None)
+
+        for username, source_counts in user_source_counter.items():
+            state_source_counts = state.user_source_counter.get(username)
+            if state_source_counts is None:
+                continue
+            for source_name, amount in source_counts.items():
+                self._decrement(state_source_counts, source_name, amount)
+            if not state_source_counts:
+                state.user_source_counter.pop(username, None)
+
+    def _cleanup_state(self, state: RollingWindowState, now_ts: float) -> None:
+        cutoff = now_ts - state.window_seconds
+        while state.buckets and state.buckets[0][0] + state.bucket_seconds <= cutoff:
+            bucket = state.buckets.popleft()
+            self._remove_bucket(state, bucket)
+
+    def _bucket_for(self, state: RollingWindowState, now_ts: float):
+        bucket_id = int(now_ts // state.bucket_seconds)
+        if state.current_bucket_id == bucket_id and state.current_bucket is not None:
+            return state.current_bucket
+
+        bucket_start = bucket_id * state.bucket_seconds
+        bucket = [bucket_start, Counter(), defaultdict(Counter), defaultdict(Counter)]
+        state.current_bucket_id = bucket_id
+        state.current_bucket = bucket
+        state.buckets.append(bucket)
+        self._cleanup_state(state, now_ts)
+        return bucket
+
+    def add(self, username: str, ip: str, source_name: str, now_ts: float = None):
+        if now_ts is None:
+            now_ts = time.monotonic()
         with self.lock:
-            self._cleanup(now_ts)
-            for ts, username, ip, source_name in self.events:
-                if ts < cutoff:
-                    continue
-                result_conn[username] += 1
-                result_ip[username][ip] += 1
-                result_source[username][source_name] += 1
-        rows = []
-        for username, conns in result_conn.items():
-            rows.append({
-                'username': username,
-                'conns': conns,
-                'uniq_ips': len(result_ip[username]),
-                'ips': dict(result_ip[username]),
-                'sources': dict(result_source[username]),
-            })
+            for state in self.states.values():
+                bucket = self._bucket_for(state, now_ts)
+                _, bucket_conn, bucket_ips, bucket_sources = bucket
+
+                bucket_conn[username] += 1
+                bucket_ips[username][ip] += 1
+                bucket_sources[username][source_name] += 1
+
+                state.conn_count[username] += 1
+                state.user_ip_counter[username][ip] += 1
+                state.user_source_counter[username][source_name] += 1
+
+    def snapshot(self, window_seconds: int, now_ts: float = None):
+        if now_ts is None:
+            now_ts = time.monotonic()
+        try:
+            state = self.states[int(window_seconds)]
+        except KeyError as exc:
+            raise ValueError(f'unconfigured rolling window: {window_seconds}') from exc
+
+        with self.lock:
+            self._cleanup_state(state, now_ts)
+            rows = []
+            for username, conns in state.conn_count.items():
+                ips = state.user_ip_counter.get(username, {})
+                sources = state.user_source_counter.get(username, {})
+                rows.append({
+                    'username': username,
+                    'conns': conns,
+                    'uniq_ips': len(ips),
+                    'ips': dict(ips),
+                    'sources': dict(sources),
+                })
+
         rows.sort(key=lambda r: (-r['uniq_ips'], -r['conns'], r['username']))
         return rows
 
@@ -429,41 +499,79 @@ def positive_int(value: str) -> int:
     return parsed
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Live Marzban watcher using official Marzban APIs and websockets.')
-    parser.add_argument('--base-url', required=True, help='Example: https://panel.example.com:8443')
-    parser.add_argument('--api-prefix', default='/api')
-    parser.add_argument('--username')
-    parser.add_argument('--password')
-    parser.add_argument('--token')
-    parser.add_argument('--insecure', action='store_true')
-    parser.add_argument('--source-interval', type=float, default=1.0, help='WebSocket interval aggregation seconds (<=10)')
-    parser.add_argument('--refresh', type=positive_int, default=10, help='Refresh live report every N seconds')
-    parser.add_argument('--live-window', type=positive_int, default=300)
-    parser.add_argument('--live-ip-limit', type=positive_int, default=3)
-    parser.add_argument('--live-conn-limit', type=positive_int, default=40)
-    parser.add_argument('--live-top', type=positive_int, default=50)
-    parser.add_argument('--show-all', action='store_true')
-    parser.add_argument('--hourly-window', type=positive_int, default=3600)
-    parser.add_argument('--hourly-ip-limit', type=positive_int, default=4)
-    parser.add_argument('--hourly-conn-limit', type=positive_int, default=250)
-    parser.add_argument('--hourly-file', default='/var/lib/marzban-watcher/hourly_suspicious.jsonl')
-    parser.add_argument('--latest-file', default='/var/lib/marzban-watcher/latest_report.txt')
-    parser.add_argument('--reconnect-delay', type=positive_int, default=3)
-    parser.add_argument('--reconnect-max-delay', type=positive_int, default=DEFAULT_RECONNECT_MAX_DELAY)
-    parser.add_argument('--log-repeat-seconds', type=positive_int, default=DEFAULT_LOG_REPEAT_SECONDS)
-    parser.add_argument('--log-file', default=DEFAULT_LOG_FILE)
-    parser.add_argument('--log-max-mb', type=positive_int, default=DEFAULT_LOG_MAX_MB)
-    parser.add_argument('--log-backups', type=positive_int, default=DEFAULT_LOG_BACKUPS)
-    parser.add_argument('--history-max-mb', type=positive_int, default=DEFAULT_HISTORY_MAX_MB)
-    args = parser.parse_args()
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError('must be greater than zero')
+    return parsed
 
+
+def env_default(name: str, default=None):
+    value = os.environ.get(name)
+    if value is None or value == '':
+        return default
+    return value
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == '':
+        return default
+    normalized = value.strip().lower()
+    if normalized in {'1', 'true', 'yes', 'on'}:
+        return True
+    if normalized in {'0', 'false', 'no', 'off'}:
+        return False
+    raise ValueError(f'{name} must be one of: 1/0, true/false, yes/no, on/off')
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description='Live Marzban watcher using official Marzban APIs and websockets.')
+    parser.add_argument('--base-url', default=env_default('BASE_URL'), help='Example: https://panel.example.com:8443')
+    parser.add_argument('--api-prefix', default=env_default('API_PREFIX', '/api'))
+    parser.add_argument('--username', default=env_default('ADMIN_USER'))
+    parser.add_argument('--password', default=env_default('ADMIN_PASS'))
+    parser.add_argument('--token', default=env_default('MARZBAN_TOKEN'))
+    parser.add_argument('--insecure', action='store_true', default=env_bool('INSECURE', False))
+    parser.add_argument('--source-interval', type=positive_float, default=env_default('SOURCE_INTERVAL', '1.0'), help='WebSocket interval aggregation seconds (<=10)')
+    parser.add_argument('--refresh', type=positive_int, default=env_default('REFRESH', '10'), help='Refresh live report every N seconds')
+    parser.add_argument('--live-window', type=positive_int, default=env_default('LIVE_WINDOW', '300'))
+    parser.add_argument('--live-ip-limit', type=positive_int, default=env_default('LIVE_IP_LIMIT', '3'))
+    parser.add_argument('--live-conn-limit', type=positive_int, default=env_default('LIVE_CONN_LIMIT', '40'))
+    parser.add_argument('--live-top', type=positive_int, default=env_default('LIVE_TOP', '50'))
+    parser.add_argument('--show-all', action='store_true', default=env_bool('SHOW_ALL', False))
+    parser.add_argument('--hourly-window', type=positive_int, default=env_default('HOURLY_WINDOW', '3600'))
+    parser.add_argument('--hourly-ip-limit', type=positive_int, default=env_default('HOURLY_IP_LIMIT', '4'))
+    parser.add_argument('--hourly-conn-limit', type=positive_int, default=env_default('HOURLY_CONN_LIMIT', '250'))
+    parser.add_argument('--hourly-file', default=env_default('HOURLY_FILE', '/var/lib/marzban-watcher/hourly_suspicious.jsonl'))
+    parser.add_argument('--latest-file', default=env_default('LATEST_FILE', '/var/lib/marzban-watcher/latest_report.txt'))
+    parser.add_argument('--reconnect-delay', type=positive_int, default=env_default('RECONNECT_DELAY', '3'))
+    parser.add_argument('--reconnect-max-delay', type=positive_int, default=env_default('RECONNECT_MAX_DELAY', str(DEFAULT_RECONNECT_MAX_DELAY)))
+    parser.add_argument('--log-repeat-seconds', type=positive_int, default=env_default('LOG_REPEAT_SECONDS', str(DEFAULT_LOG_REPEAT_SECONDS)))
+    parser.add_argument('--log-file', default=env_default('LOG_FILE', DEFAULT_LOG_FILE))
+    parser.add_argument('--log-max-mb', type=positive_int, default=env_default('LOG_MAX_MB', str(DEFAULT_LOG_MAX_MB)))
+    parser.add_argument('--log-backups', type=positive_int, default=env_default('LOG_BACKUPS', str(DEFAULT_LOG_BACKUPS)))
+    parser.add_argument('--history-max-mb', type=positive_int, default=env_default('HISTORY_MAX_MB', str(DEFAULT_HISTORY_MAX_MB)))
+    parser.add_argument('--stats-max-buckets', type=positive_int, default=env_default('STATS_MAX_BUCKETS', str(DEFAULT_STATS_MAX_BUCKETS)))
+    return parser
+
+
+def parse_args(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.base_url:
+        parser.error('Provide --base-url or BASE_URL')
     if not args.token and (not args.username or not args.password):
-        parser.error('Provide either --token or both --username and --password')
-    if args.source_interval <= 0 or args.source_interval > 10:
-        parser.error('--source-interval must be >0 and <=10')
+        parser.error('Provide either --token/MARZBAN_TOKEN or username and password via arguments/environment')
+    if args.source_interval > 10:
+        parser.error('--source-interval must be <=10')
     if args.reconnect_max_delay < args.reconnect_delay:
         parser.error('--reconnect-max-delay must be >= --reconnect-delay')
+    return args
+
+
+def main():
+    args = parse_args()
 
     logger = configure_logger(args.log_file, args.log_max_mb, args.log_backups)
     logger.info('%s starting', APP_NAME)
@@ -480,7 +588,10 @@ def main():
         if args.insecure:
             requests.packages.urllib3.disable_warnings()
 
-        stats = RollingStats(max(args.live_window, args.hourly_window))
+        stats = RollingStats(
+            [args.live_window, args.hourly_window],
+            max_buckets=args.stats_max_buckets,
+        )
         stop_evt = threading.Event()
         install_signal_handlers(stop_evt)
 

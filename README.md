@@ -1,6 +1,6 @@
 # Marzban Watcher
 
-Live suspicious-usage watcher for Marzban with interactive install, safe in-place updates, bounded operational logs, live reports, hourly suspicious-history storage, and a simple control menu.
+Live suspicious-usage watcher for Marzban with interactive install, safe in-place updates, bounded operational logs, bounded in-memory rolling statistics, live reports, hourly suspicious-history storage, and a simple control menu.
 
 ## What it does
 
@@ -10,6 +10,8 @@ Live suspicious-usage watcher for Marzban with interactive install, safe in-plac
 - Archives suspicious hourly snapshots in `/var/lib/marzban-watcher/hourly_suspicious.jsonl`.
 - Runs as a `systemd` service.
 - Uses bounded rotating operational logs so a reconnect loop cannot fill the server disk.
+- Aggregates rolling connection statistics into adaptive time buckets instead of retaining one Python object per raw connection.
+- Keeps panel credentials in the root-readable environment file instead of exposing them in the process command line.
 - Supports non-interactive in-place updates that preserve the existing panel configuration.
 
 ## Install
@@ -41,7 +43,7 @@ For installations that already have `/etc/marzban-watcher.env`, update without r
 bash <(curl -fsSL https://raw.githubusercontent.com/ach1992/marzban-watcher/main/install.sh) --update
 ```
 
-After this version is installed, future updates can also use:
+After the updater command is installed, future updates can also use:
 
 ```bash
 marzban-watcher update
@@ -56,7 +58,13 @@ The update path:
 5. rolls the installed files back if the updated service fails verification;
 6. only after a successful restart, removes obsolete unbounded `marzban-watcher.stdout.log` and `marzban-watcher.stderr.log` files.
 
-This means old installations that accumulated very large stdout/stderr logs reclaim that disk space automatically during a successful update.
+## Credential handling
+
+`/etc/marzban-watcher.env` is installed with mode `0600`. The `systemd` unit loads it with `EnvironmentFile=` and starts Python directly. Credentials are therefore no longer copied into `ExecStart` arguments and do not appear in normal `ps` or `systemctl status` command lines.
+
+The CLI `reconfigure` command reads known keys as data and does not shell-`source` the credential file.
+
+Root can still inspect a root-owned service environment, so the environment file is not a substitute for normal host/root security. If a credential has already been exposed elsewhere, rotate it at the Marzban panel and then run `marzban-watcher reconfigure`.
 
 ## Bounded storage defaults
 
@@ -77,6 +85,27 @@ With the defaults, the operational application log uses at most approximately fo
 The hourly suspicious JSONL history is also capped. When it exceeds `HISTORY_MAX_MB`, the oldest complete JSONL records are discarded and the newest records are retained. The cap is enforced at startup and after hourly writes, so old oversized installations self-correct after upgrade.
 
 Repeated WebSocket failures use exponential reconnect backoff up to `RECONNECT_MAX_DELAY`, and repeated equivalent disconnect messages are rate-limited by `LOG_REPEAT_SECONDS`.
+
+## Bounded rolling-memory model
+
+Older versions kept one deque entry for every accepted connection for the entire longest rolling window. On busy installations that could consume hundreds of MiB within minutes.
+
+The current implementation maintains aggregate counters in adaptive time buckets. By default `STATS_MAX_BUCKETS=300`, so each configured rolling window retains roughly 300 time slices regardless of whether the window is 15 minutes or 5 hours. For example:
+
+```text
+LIVE_WINDOW=900       -> approximately 3-second buckets
+HOURLY_WINDOW=18000   -> approximately 60-second buckets
+```
+
+This changes only the rolling-window boundary precision: a snapshot can include up to one bucket of data immediately older than the exact cutoff. With the default 300 buckets this is at most about 0.33% of the configured window. Connection counts, IP counts, and source counts inside retained buckets remain exact.
+
+Advanced installations can override the target bucket count in `/etc/marzban-watcher.env`:
+
+```text
+STATS_MAX_BUCKETS=300
+```
+
+Higher values improve boundary precision at the cost of memory; lower values reduce memory further.
 
 ## Commands
 

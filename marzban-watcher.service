@@ -8,7 +8,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 EnvironmentFile=/etc/marzban-watcher.env
-ExecStart=/bin/bash -lc '/opt/marzban-watcher/.venv/bin/python /opt/marzban-watcher/marzban_watch.py --base-url "$BASE_URL" --username "$ADMIN_USER" --password "$ADMIN_PASS" --refresh "$REFRESH" --live-window "$LIVE_WINDOW" --live-ip-limit "$LIVE_IP_LIMIT" --live-conn-limit "$LIVE_CONN_LIMIT" --live-top "${LIVE_TOP:-50}" --hourly-window "$HOURLY_WINDOW" --hourly-ip-limit "$HOURLY_IP_LIMIT" --hourly-conn-limit "$HOURLY_CONN_LIMIT" --reconnect-max-delay "${RECONNECT_MAX_DELAY:-60}" --log-repeat-seconds "${LOG_REPEAT_SECONDS:-300}" --log-max-mb "${LOG_MAX_MB:-64}" --log-backups "${LOG_BACKUPS:-3}" --history-max-mb "${HISTORY_MAX_MB:-512}" ${INSECURE:+--insecure}'
+ExecStart=/opt/marzban-watcher/.venv/bin/python /opt/marzban-watcher/marzban_watch.py
 Restart=on-failure
 RestartSec=10
 User=root

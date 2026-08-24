@@ -48,6 +48,29 @@ class StorageLimitTests(unittest.TestCase):
             self.assertEqual(retained[-1]['index'], rows[-1]['index'])
             self.assertGreater(retained[0]['index'], 0)
 
+    def test_history_trim_handles_overlapping_in_place_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'history.jsonl'
+            with path.open('w', encoding='utf-8') as handle:
+                for index in range(25_000):
+                    handle.write(json.dumps({'index': index, 'payload': 'x' * 96}) + '\n')
+
+            original_size = path.stat().st_size
+            max_bytes = 5 * 1024 * 1024 // 2
+            self.assertGreater(original_size, max_bytes)
+            self.assertLess(original_size - max_bytes, 1024 * 1024)
+
+            changed = watcher.trim_jsonl_to_max_bytes(str(path), max_bytes)
+            self.assertTrue(changed)
+            self.assertLessEqual(path.stat().st_size, max_bytes)
+            self.assertEqual([item.name for item in Path(tmp).iterdir()], ['history.jsonl'])
+
+            with path.open('r', encoding='utf-8') as handle:
+                retained = [json.loads(line) for line in handle if line.strip()]
+            self.assertTrue(retained)
+            self.assertEqual(retained[-1]['index'], 24_999)
+            self.assertGreater(retained[0]['index'], 0)
+
     def test_rotating_logger_bounds_file_count_and_size(self):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / 'watcher.log'

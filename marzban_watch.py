@@ -518,11 +518,9 @@ def env_bool(name: str, default: bool = False) -> bool:
     if value is None or value == '':
         return default
     normalized = value.strip().lower()
-    if normalized in {'1', 'true', 'yes', 'on'}:
-        return True
     if normalized in {'0', 'false', 'no', 'off'}:
         return False
-    raise ValueError(f'{name} must be one of: 1/0, true/false, yes/no, on/off')
+    return True
 
 
 def build_parser() -> argparse.ArgumentParser:

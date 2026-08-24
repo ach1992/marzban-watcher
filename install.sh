@@ -308,7 +308,7 @@ upgrade_install() {
   install_staged_files
 
   echo "[INFO] Refreshing Python dependencies..."
-  if ! "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"; then
+  if ! "$APP_DIR/.venv/bin/pip" install --no-cache-dir -r "$APP_DIR/requirements.txt"; then
     restore_backup
     exit 1
   fi

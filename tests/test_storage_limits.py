@@ -152,6 +152,17 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(args.live_window, 900)
         self.assertEqual(args.hourly_window, 18000)
 
+    def test_nonempty_legacy_insecure_value_remains_enabled(self):
+        env = {
+            'BASE_URL': 'https://panel.example.test:8443',
+            'ADMIN_USER': 'admin',
+            'ADMIN_PASS': 'secret',
+            'INSECURE': 'legacy-custom-value',
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            args = watcher.parse_args([])
+        self.assertTrue(args.insecure)
+
     def test_service_unit_does_not_put_credentials_in_argv(self):
         service = (MODULE_PATH.parent / 'marzban-watcher.service').read_text(encoding='utf-8')
         exec_line = next(line for line in service.splitlines() if line.startswith('ExecStart='))

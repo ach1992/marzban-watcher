@@ -180,16 +180,33 @@ ensure_upgrade_env_defaults() {
   ensure_env_default LOG_REPEAT_SECONDS 300
 }
 
+atomic_replace_file() {
+  local source="$1"
+  local destination="$2"
+  local mode="$3"
+  local tmp
+
+  tmp="$(mktemp "${destination}.new.XXXXXX")"
+  if ! install -m "$mode" "$source" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! mv -f "$tmp" "$destination"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
 install_staged_files() {
   mkdir -p "$APP_DIR" "$DATA_DIR"
   chmod 700 "$DATA_DIR"
   cp "$STAGE_DIR/marzban_watch.py" "$APP_DIR/marzban_watch.py"
   cp "$STAGE_DIR/uninstall.sh" "$APP_DIR/uninstall.sh"
   cp "$STAGE_DIR/requirements.txt" "$APP_DIR/requirements.txt"
-  cp "$STAGE_DIR/marzban-watcher" "$BIN_FILE"
+  atomic_replace_file "$STAGE_DIR/marzban-watcher" "$BIN_FILE" 0755
   cp "$STAGE_DIR/marzban-watcher.service" "$SERVICE_FILE"
   chmod 700 "$APP_DIR/marzban_watch.py"
-  chmod +x "$BIN_FILE" "$APP_DIR/uninstall.sh"
+  chmod +x "$APP_DIR/uninstall.sh"
   ln -sf "$BIN_FILE" "$COMPAT_BIN"
 }
 
@@ -208,7 +225,7 @@ restore_backup() {
   [[ -f "$BACKUP_DIR/marzban_watch.py" ]] && cp -a "$BACKUP_DIR/marzban_watch.py" "$APP_DIR/marzban_watch.py"
   [[ -f "$BACKUP_DIR/uninstall.sh" ]] && cp -a "$BACKUP_DIR/uninstall.sh" "$APP_DIR/uninstall.sh"
   [[ -f "$BACKUP_DIR/requirements.txt" ]] && cp -a "$BACKUP_DIR/requirements.txt" "$APP_DIR/requirements.txt"
-  [[ -f "$BACKUP_DIR/marzban-watcher" ]] && cp -a "$BACKUP_DIR/marzban-watcher" "$BIN_FILE"
+  [[ -f "$BACKUP_DIR/marzban-watcher" ]] && atomic_replace_file "$BACKUP_DIR/marzban-watcher" "$BIN_FILE" 0755
   [[ -f "$BACKUP_DIR/marzban-watcher.service" ]] && cp -a "$BACKUP_DIR/marzban-watcher.service" "$SERVICE_FILE"
   [[ -f "$BACKUP_DIR/marzban-watcher.env" ]] && cp -a "$BACKUP_DIR/marzban-watcher.env" "$ENV_FILE"
   systemctl daemon-reload

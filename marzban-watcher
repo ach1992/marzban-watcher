@@ -6,22 +6,22 @@ SERVICE="marzban-watcher"
 ENV_FILE="/etc/marzban-watcher.env"
 LATEST_FILE="/var/lib/marzban-watcher/latest_report.txt"
 HOURLY_FILE="/var/lib/marzban-watcher/hourly_suspicious.jsonl"
-STDOUT_LOG="/var/log/marzban-watcher.stdout.log"
-STDERR_LOG="/var/log/marzban-watcher.stderr.log"
+LOG_FILE="/var/log/marzban-watcher.log"
 INSTALL_DIR="/opt/marzban-watcher"
 UNINSTALL_SCRIPT="$INSTALL_DIR/uninstall.sh"
+UPDATE_URL="https://raw.githubusercontent.com/ach1992/marzban-watcher/main/install.sh"
 
 banner() {
   clear 2>/dev/null || true
-  cat <<'EOF'
+  cat <<'BANNER'
 ============================================================
  __  __                     _                     __        __    _       _
-|  \/  | __ _ _ __ ______ _| |__   __ _ _ __      \ \      / /_ _| |_ ___| |__   ___ _ __
+| \/  | __ _ _ __ ______ _| |__   __ _ _ __      \ \      / /_ _| |_ ___| |__   ___ _ __
 | |\/| |/ _` | '__|_  / _` | '_ \ / _` | '_ \      \ \ /\ / / _` | __/ __| '_ \ / _ \ '__|
 | |  | | (_| | |   / / (_| | |_) | (_| | | | |      \ V  V / (_| | || (__| | | |  __/ |
 |_|  |_|\__,_|_|  /___\__,_|_.__/ \__,_|_| |_|       \_/\_/ \__,_|\__\___|_| |_|\___|_|
 ============================================================
-EOF
+BANNER
 }
 
 ensure_root() {
@@ -52,8 +52,12 @@ show_hourly() {
 }
 
 show_logs() {
-  touch "$STDOUT_LOG" "$STDERR_LOG"
-  tail -f "$STDOUT_LOG" "$STDERR_LOG"
+  if [[ -f "$LOG_FILE" ]]; then
+    tail -F "$LOG_FILE"
+  else
+    echo "No application log found yet: $LOG_FILE"
+    echo "Service fallback errors: journalctl -u $SERVICE -n 100 --no-pager"
+  fi
 }
 
 live_watch() {
@@ -64,6 +68,24 @@ service_action() {
   local action="$1"
   systemctl "$action" "$SERVICE"
   systemctl status "$SERVICE" --no-pager -l || true
+}
+
+update_app() {
+  ensure_root
+  local tmp
+  local status
+  tmp="$(mktemp)"
+  echo "Downloading current installer..."
+  if ! curl -fsSL "$UPDATE_URL" -o "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  set +e
+  bash "$tmp" --update
+  status=$?
+  set -e
+  rm -f "$tmp"
+  return "$status"
 }
 
 reconfigure() {
@@ -105,7 +127,13 @@ reconfigure() {
   read -r -p "Hourly connection limit [$HOURLY_CONN_LIMIT]: " input
   [[ -n "$input" ]] && HOURLY_CONN_LIMIT="$input"
 
-  cat > "$ENV_FILE" <<EOF
+  LOG_MAX_MB="${LOG_MAX_MB:-64}"
+  LOG_BACKUPS="${LOG_BACKUPS:-3}"
+  HISTORY_MAX_MB="${HISTORY_MAX_MB:-512}"
+  RECONNECT_MAX_DELAY="${RECONNECT_MAX_DELAY:-60}"
+  LOG_REPEAT_SECONDS="${LOG_REPEAT_SECONDS:-300}"
+
+  cat > "$ENV_FILE" <<ENV
 BASE_URL=$(sanitize_single_line "$BASE_URL")
 ADMIN_USER=$(sanitize_single_line "$ADMIN_USER")
 ADMIN_PASS=$(sanitize_single_line "$ADMIN_PASS")
@@ -117,8 +145,13 @@ LIVE_TOP=$(sanitize_single_line "${LIVE_TOP:-50}")
 HOURLY_WINDOW=$(sanitize_single_line "$HOURLY_WINDOW")
 HOURLY_IP_LIMIT=$(sanitize_single_line "$HOURLY_IP_LIMIT")
 HOURLY_CONN_LIMIT=$(sanitize_single_line "$HOURLY_CONN_LIMIT")
+LOG_MAX_MB=$(sanitize_single_line "$LOG_MAX_MB")
+LOG_BACKUPS=$(sanitize_single_line "$LOG_BACKUPS")
+HISTORY_MAX_MB=$(sanitize_single_line "$HISTORY_MAX_MB")
+RECONNECT_MAX_DELAY=$(sanitize_single_line "$RECONNECT_MAX_DELAY")
+LOG_REPEAT_SECONDS=$(sanitize_single_line "$LOG_REPEAT_SECONDS")
 INSECURE=$(sanitize_single_line "${INSECURE:-}")
-EOF
+ENV
   chmod 600 "$ENV_FILE"
   systemctl restart "$SERVICE"
   echo "Configuration updated and service restarted."
@@ -133,10 +166,11 @@ menu() {
     echo "4) Logs"
     echo "5) Status"
     echo "6) Reconfigure"
-    echo "7) Start"
-    echo "8) Stop"
-    echo "9) Restart"
-    echo "10) Uninstall"
+    echo "7) Update"
+    echo "8) Start"
+    echo "9) Stop"
+    echo "10) Restart"
+    echo "11) Uninstall"
     echo "0) Exit"
     echo
     read -r -p "Select an option: " choice
@@ -147,10 +181,11 @@ menu() {
       4) show_logs ;;
       5) systemctl status "$SERVICE" --no-pager -l || true ;;
       6) reconfigure ;;
-      7) ensure_root; service_action start ;;
-      8) ensure_root; service_action stop ;;
-      9) ensure_root; service_action restart ;;
-      10)
+      7) update_app ;;
+      8) ensure_root; service_action start ;;
+      9) ensure_root; service_action stop ;;
+      10) ensure_root; service_action restart ;;
+      11)
         ensure_root
         if [[ -x "$UNINSTALL_SCRIPT" ]]; then
           "$UNINSTALL_SCRIPT"
@@ -174,6 +209,7 @@ case "$cmd" in
   latest) show_latest ;;
   hourly) show_hourly ;;
   logs) show_logs ;;
+  update) update_app ;;
   start|stop|restart)
     ensure_root
     service_action "$cmd"
@@ -189,7 +225,7 @@ case "$cmd" in
     "$UNINSTALL_SCRIPT"
     ;;
   *)
-    echo "Usage: marzban-watcher {menu|live|latest|hourly|logs|status|reconfigure|start|stop|restart|uninstall}"
+    echo "Usage: marzban-watcher {menu|live|latest|hourly|logs|status|reconfigure|update|start|stop|restart|uninstall}"
     exit 1
     ;;
 esac

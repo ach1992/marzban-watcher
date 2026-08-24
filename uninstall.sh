@@ -29,9 +29,10 @@ rm -f /etc/marzban-watcher.env
 rm -f /etc/marzban-watch.env
 rm -rf /var/lib/marzban-watcher
 rm -rf /var/lib/marzban-watch
-rm -f /var/log/marzban-watcher.stdout.log
-rm -f /var/log/marzban-watcher.stderr.log
-rm -f /var/log/marzban-watch.stdout.log
-rm -f /var/log/marzban-watch.stderr.log
+rm -f /var/log/marzban-watcher.log /var/log/marzban-watcher.log.*
+rm -f /var/log/marzban-watcher.stdout.log /var/log/marzban-watcher.stdout.log.*
+rm -f /var/log/marzban-watcher.stderr.log /var/log/marzban-watcher.stderr.log.*
+rm -f /var/log/marzban-watch.stdout.log /var/log/marzban-watch.stdout.log.*
+rm -f /var/log/marzban-watch.stderr.log /var/log/marzban-watch.stderr.log.*
 
 echo "[OK] Marzban Watcher removed."

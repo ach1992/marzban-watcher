@@ -9,15 +9,19 @@
 
 import argparse
 import json
+import logging
 import os
+import re
 import signal
 import ssl
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import requests
@@ -26,6 +30,12 @@ import websocket
 
 APP_NAME = "Marzban Watcher"
 APP_LINE = "=" * 120
+DEFAULT_LOG_FILE = "/var/log/marzban-watcher.log"
+DEFAULT_LOG_MAX_MB = 64
+DEFAULT_LOG_BACKUPS = 3
+DEFAULT_HISTORY_MAX_MB = 512
+DEFAULT_RECONNECT_MAX_DELAY = 60
+DEFAULT_LOG_REPEAT_SECONDS = 300
 
 
 def join_path(*parts: str) -> str:
@@ -59,22 +69,104 @@ def iso_now() -> str:
     return utc_now().isoformat()
 
 
-def ensure_dir(path: str) -> None:
-    Path(path).mkdir(parents=True, exist_ok=True)
+def ensure_dir(path: str, mode=None) -> None:
+    directory = Path(path)
+    directory.mkdir(parents=True, exist_ok=True)
+    if mode is not None:
+        try:
+            os.chmod(directory, mode)
+        except PermissionError:
+            pass
+
+
+def secure_file(path: str, mode: int = 0o600) -> None:
+    try:
+        if os.path.exists(path):
+            os.chmod(path, mode)
+    except PermissionError:
+        pass
 
 
 def append_jsonl(path: str, obj: dict) -> None:
-    ensure_dir(str(Path(path).parent))
+    ensure_dir(str(Path(path).parent), 0o700)
     with open(path, 'a', encoding='utf-8') as f:
         f.write(json.dumps(obj, ensure_ascii=False) + '\n')
+    secure_file(path)
 
 
 def write_text(path: str, text: str) -> None:
-    ensure_dir(str(Path(path).parent))
+    ensure_dir(str(Path(path).parent), 0o700)
     tmp = f'{path}.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         f.write(text)
+    secure_file(tmp)
     os.replace(tmp, path)
+    secure_file(path)
+
+
+def trim_jsonl_to_max_bytes(path: str, max_bytes: int) -> bool:
+    """Keep the newest complete JSONL records within max_bytes."""
+    if max_bytes <= 0 or not os.path.isfile(path):
+        return False
+
+    size = os.path.getsize(path)
+    secure_file(path)
+    if size <= max_bytes:
+        return False
+
+    start = max(0, size - max_bytes)
+    with open(path, 'r+b') as handle:
+        handle.seek(start)
+        if start > 0:
+            handle.readline()
+        read_pos = handle.tell()
+        write_pos = 0
+
+        while True:
+            handle.seek(read_pos)
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            handle.seek(write_pos)
+            handle.write(chunk)
+            read_pos += len(chunk)
+            write_pos += len(chunk)
+
+        handle.truncate(write_pos)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    secure_file(path)
+    return True
+
+
+def sanitize_log_message(value: object) -> str:
+    text = str(value)
+    text = re.sub(r'(?i)(token=)[^&\s]+', r'\1[REDACTED]', text)
+    text = re.sub(r'(?i)(authorization:\s*bearer\s+)[^\s]+', r'\1[REDACTED]', text)
+    text = re.sub(r'(?i)(access_token["\'=:\s]+)[^\s,}"\']+', r'\1[REDACTED]', text)
+    return text
+
+
+def configure_logger(path: str, max_mb: int, backups: int) -> logging.Logger:
+    ensure_dir(str(Path(path).parent))
+    logger = logging.getLogger('marzban-watcher')
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+    handler = RotatingFileHandler(
+        path,
+        maxBytes=max_mb * 1024 * 1024,
+        backupCount=backups,
+        encoding='utf-8',
+    )
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    logger.addHandler(handler)
+    secure_file(path, 0o640)
+    return logger
 
 
 def parse_log_line(line: str):
@@ -97,7 +189,7 @@ def parse_log_line(line: str):
 class RollingStats:
     def __init__(self, max_window_seconds: int):
         self.max_window = max_window_seconds
-        self.events = deque()  # (arrival_ts, username, ip, source_name)
+        self.events = deque()
         self.conn_count = Counter()
         self.user_ip_counter = defaultdict(Counter)
         self.user_source_counter = defaultdict(Counter)
@@ -192,15 +284,41 @@ def get_nodes(session: requests.Session, base_url: str, api_prefix: str, token: 
     return payload
 
 
-def worker(label, url, stats: RollingStats, insecure: bool, reconnect_delay: int, stop_evt: threading.Event):
+def worker(
+    label,
+    url,
+    stats: RollingStats,
+    insecure: bool,
+    reconnect_delay: int,
+    reconnect_max_delay: int,
+    log_repeat_seconds: int,
+    stop_evt: threading.Event,
+    logger: logging.Logger,
+):
     sslopt = None
     if url.startswith('wss://'):
         sslopt = {'cert_reqs': ssl.CERT_NONE} if insecure else None
+
+    base_delay = max(1, reconnect_delay)
+    retry_delay = base_delay
+    consecutive_failures = 0
+    suppressed_failures = 0
+    last_warning = 0.0
+    ever_connected = False
+
     while not stop_evt.is_set():
         ws = None
         try:
             ws = websocket.create_connection(url, timeout=20, sslopt=sslopt)
-            print(f'[INFO] connected to {label}', file=sys.stderr, flush=True)
+            if consecutive_failures:
+                logger.info('%s reconnected after %d failed attempt(s)', label, consecutive_failures)
+            elif not ever_connected:
+                logger.info('%s connected', label)
+            ever_connected = True
+            consecutive_failures = 0
+            suppressed_failures = 0
+            retry_delay = base_delay
+
             while not stop_evt.is_set():
                 message = ws.recv()
                 if message is None:
@@ -214,8 +332,28 @@ def worker(label, url, stats: RollingStats, insecure: bool, reconnect_delay: int
         except KeyboardInterrupt:
             return
         except Exception as exc:
-            print(f'[WARN] {label} disconnected: {exc}', file=sys.stderr, flush=True)
-            time.sleep(reconnect_delay)
+            consecutive_failures += 1
+            now = time.monotonic()
+            should_log = consecutive_failures == 1 or now - last_warning >= log_repeat_seconds
+            if should_log:
+                suffix = ''
+                if suppressed_failures:
+                    suffix = f' ({suppressed_failures} similar failure(s) suppressed)'
+                logger.warning(
+                    '%s disconnected: %s; retrying in %ss%s',
+                    label,
+                    sanitize_log_message(exc),
+                    retry_delay,
+                    suffix,
+                )
+                last_warning = now
+                suppressed_failures = 0
+            else:
+                suppressed_failures += 1
+
+            if stop_evt.wait(retry_delay):
+                return
+            retry_delay = min(reconnect_max_delay, max(base_delay, retry_delay * 2))
         finally:
             try:
                 if ws:
@@ -284,6 +422,13 @@ def install_signal_handlers(stop_evt: threading.Event):
     signal.signal(signal.SIGTERM, _handler)
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError('must be greater than zero')
+    return parsed
+
+
 def main():
     parser = argparse.ArgumentParser(description='Live Marzban watcher using official Marzban APIs and websockets.')
     parser.add_argument('--base-url', required=True, help='Example: https://panel.example.com:8443')
@@ -293,73 +438,145 @@ def main():
     parser.add_argument('--token')
     parser.add_argument('--insecure', action='store_true')
     parser.add_argument('--source-interval', type=float, default=1.0, help='WebSocket interval aggregation seconds (<=10)')
-    parser.add_argument('--refresh', type=int, default=10, help='Refresh live report every N seconds')
-    parser.add_argument('--live-window', type=int, default=300)
-    parser.add_argument('--live-ip-limit', type=int, default=3)
-    parser.add_argument('--live-conn-limit', type=int, default=40)
-    parser.add_argument('--live-top', type=int, default=50)
+    parser.add_argument('--refresh', type=positive_int, default=10, help='Refresh live report every N seconds')
+    parser.add_argument('--live-window', type=positive_int, default=300)
+    parser.add_argument('--live-ip-limit', type=positive_int, default=3)
+    parser.add_argument('--live-conn-limit', type=positive_int, default=40)
+    parser.add_argument('--live-top', type=positive_int, default=50)
     parser.add_argument('--show-all', action='store_true')
-    parser.add_argument('--hourly-window', type=int, default=3600)
-    parser.add_argument('--hourly-ip-limit', type=int, default=4)
-    parser.add_argument('--hourly-conn-limit', type=int, default=250)
+    parser.add_argument('--hourly-window', type=positive_int, default=3600)
+    parser.add_argument('--hourly-ip-limit', type=positive_int, default=4)
+    parser.add_argument('--hourly-conn-limit', type=positive_int, default=250)
     parser.add_argument('--hourly-file', default='/var/lib/marzban-watcher/hourly_suspicious.jsonl')
     parser.add_argument('--latest-file', default='/var/lib/marzban-watcher/latest_report.txt')
-    parser.add_argument('--reconnect-delay', type=int, default=3)
+    parser.add_argument('--reconnect-delay', type=positive_int, default=3)
+    parser.add_argument('--reconnect-max-delay', type=positive_int, default=DEFAULT_RECONNECT_MAX_DELAY)
+    parser.add_argument('--log-repeat-seconds', type=positive_int, default=DEFAULT_LOG_REPEAT_SECONDS)
+    parser.add_argument('--log-file', default=DEFAULT_LOG_FILE)
+    parser.add_argument('--log-max-mb', type=positive_int, default=DEFAULT_LOG_MAX_MB)
+    parser.add_argument('--log-backups', type=positive_int, default=DEFAULT_LOG_BACKUPS)
+    parser.add_argument('--history-max-mb', type=positive_int, default=DEFAULT_HISTORY_MAX_MB)
     args = parser.parse_args()
 
     if not args.token and (not args.username or not args.password):
         parser.error('Provide either --token or both --username and --password')
     if args.source_interval <= 0 or args.source_interval > 10:
         parser.error('--source-interval must be >0 and <=10')
+    if args.reconnect_max_delay < args.reconnect_delay:
+        parser.error('--reconnect-max-delay must be >= --reconnect-delay')
 
-    session = requests.Session()
-    session.verify = not args.insecure
-    if args.insecure:
-        requests.packages.urllib3.disable_warnings()
+    logger = configure_logger(args.log_file, args.log_max_mb, args.log_backups)
+    logger.info('%s starting', APP_NAME)
 
-    token = args.token or login(session, args.base_url, args.api_prefix, args.username, args.password)
-    nodes = get_nodes(session, args.base_url, args.api_prefix, token)
+    try:
+        ensure_dir(str(Path(args.hourly_file).parent), 0o700)
+        secure_file(args.hourly_file)
+        secure_file(args.latest_file)
+        if trim_jsonl_to_max_bytes(args.hourly_file, args.history_max_mb * 1024 * 1024):
+            logger.info('trimmed hourly history to configured %d MiB cap', args.history_max_mb)
 
-    stats = RollingStats(max(args.live_window, args.hourly_window))
-    stop_evt = threading.Event()
-    install_signal_handlers(stop_evt)
+        session = requests.Session()
+        session.verify = not args.insecure
+        if args.insecure:
+            requests.packages.urllib3.disable_warnings()
 
-    targets = []
-    core_ws = ws_url(args.base_url, args.api_prefix, 'core/logs', token, args.source_interval)
-    targets.append(('Master', core_ws))
-    for node in nodes:
-        nid = node['id']
-        nname = node.get('name', f'node-{nid}')
-        node_ws = ws_url(args.base_url, args.api_prefix, f'node/{nid}/logs', token, args.source_interval)
-        targets.append((nname, node_ws))
+        stats = RollingStats(max(args.live_window, args.hourly_window))
+        stop_evt = threading.Event()
+        install_signal_handlers(stop_evt)
 
-    for label, url in targets:
-        t = threading.Thread(target=worker, args=(label, url, stats, args.insecure, args.reconnect_delay, stop_evt), daemon=True)
-        t.start()
+        targets = []
+        startup_delay = max(1, args.reconnect_delay)
+        startup_failures = 0
+        startup_suppressed = 0
+        startup_last_warning = 0.0
+        while not stop_evt.is_set():
+            try:
+                token = args.token or login(session, args.base_url, args.api_prefix, args.username, args.password)
+                nodes = get_nodes(session, args.base_url, args.api_prefix, token)
+                core_ws = ws_url(args.base_url, args.api_prefix, 'core/logs', token, args.source_interval)
+                targets = [('Master', core_ws)]
+                for node in nodes:
+                    nid = node['id']
+                    nname = node.get('name', f'node-{nid}')
+                    node_ws = ws_url(args.base_url, args.api_prefix, f'node/{nid}/logs', token, args.source_interval)
+                    targets.append((nname, node_ws))
+                if startup_failures:
+                    logger.info('Marzban API connection recovered after %d failed attempt(s)', startup_failures)
+                break
+            except Exception as exc:
+                startup_failures += 1
+                now_mono = time.monotonic()
+                if startup_failures == 1 or now_mono - startup_last_warning >= args.log_repeat_seconds:
+                    suffix = ''
+                    if startup_suppressed:
+                        suffix = f' ({startup_suppressed} similar failure(s) suppressed)'
+                    logger.warning(
+                        'Marzban API unavailable: %s; retrying in %ss%s',
+                        sanitize_log_message(exc),
+                        startup_delay,
+                        suffix,
+                    )
+                    startup_last_warning = now_mono
+                    startup_suppressed = 0
+                else:
+                    startup_suppressed += 1
+                if stop_evt.wait(startup_delay):
+                    break
+                startup_delay = min(args.reconnect_max_delay, max(args.reconnect_delay, startup_delay * 2))
 
-    last_live = 0.0
-    last_hour = int(time.time() // 3600)
+        if stop_evt.is_set():
+            logger.info('%s stopping before API connection was established', APP_NAME)
+            return
 
-    while not stop_evt.is_set():
-        now = time.time()
-        if now - last_live >= args.refresh:
-            live_rows = stats.snapshot(args.live_window)
-            report = format_rows(live_rows, args.live_ip_limit, args.live_conn_limit, args.live_top, args.show_all)
-            write_text(args.latest_file, report)
-            print(report, end='')
-            last_live = now
+        logger.info('watching %d websocket source(s)', len(targets))
+        for label, url in targets:
+            t = threading.Thread(
+                target=worker,
+                args=(
+                    label,
+                    url,
+                    stats,
+                    args.insecure,
+                    args.reconnect_delay,
+                    args.reconnect_max_delay,
+                    args.log_repeat_seconds,
+                    stop_evt,
+                    logger,
+                ),
+                daemon=True,
+            )
+            t.start()
 
-        current_hour = int(now // 3600)
-        if current_hour != last_hour:
-            hour_rows = stats.snapshot(args.hourly_window)
-            records = hourly_records(hour_rows, args.hourly_ip_limit, args.hourly_conn_limit)
-            for record in records:
-                append_jsonl(args.hourly_file, record)
-            if records:
-                print(f'[INFO] wrote {len(records)} hourly suspicious records to {args.hourly_file}', file=sys.stderr, flush=True)
-            last_hour = current_hour
+        last_live = 0.0
+        last_hour = int(time.time() // 3600)
 
-        time.sleep(1)
+        while not stop_evt.is_set():
+            now = time.time()
+            if now - last_live >= args.refresh:
+                live_rows = stats.snapshot(args.live_window)
+                report = format_rows(live_rows, args.live_ip_limit, args.live_conn_limit, args.live_top, args.show_all)
+                write_text(args.latest_file, report)
+                last_live = now
+
+            current_hour = int(now // 3600)
+            if current_hour != last_hour:
+                hour_rows = stats.snapshot(args.hourly_window)
+                records = hourly_records(hour_rows, args.hourly_ip_limit, args.hourly_conn_limit)
+                for record in records:
+                    append_jsonl(args.hourly_file, record)
+                if records:
+                    logger.info('wrote %d hourly suspicious record(s)', len(records))
+                if trim_jsonl_to_max_bytes(args.hourly_file, args.history_max_mb * 1024 * 1024):
+                    logger.info('trimmed hourly history to configured %d MiB cap', args.history_max_mb)
+                last_hour = current_hour
+
+            stop_evt.wait(1)
+
+        logger.info('%s stopping', APP_NAME)
+    except Exception as exc:
+        detail = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        logger.error('fatal error:\n%s', sanitize_log_message(detail).rstrip())
+        raise
 
 
 if __name__ == '__main__':

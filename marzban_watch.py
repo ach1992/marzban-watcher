@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import signal
 import ssl
 import sys
@@ -115,24 +114,30 @@ def trim_jsonl_to_max_bytes(path: str, max_bytes: int) -> bool:
     if size <= max_bytes:
         return False
 
-    tmp = f'{path}.trim.tmp'
     start = max(0, size - max_bytes)
-    try:
-        with open(path, 'rb') as src, open(tmp, 'wb') as dst:
-            src.seek(start)
-            if start > 0:
-                src.readline()
-            shutil.copyfileobj(src, dst, length=1024 * 1024)
-        secure_file(tmp)
-        os.replace(tmp, path)
-        secure_file(path)
-        return True
-    finally:
-        try:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-        except OSError:
-            pass
+    with open(path, 'r+b') as handle:
+        handle.seek(start)
+        if start > 0:
+            handle.readline()
+        read_pos = handle.tell()
+        write_pos = 0
+
+        while True:
+            handle.seek(read_pos)
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            handle.seek(write_pos)
+            handle.write(chunk)
+            read_pos += len(chunk)
+            write_pos += len(chunk)
+
+        handle.truncate(write_pos)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    secure_file(path)
+    return True
 
 
 def sanitize_log_message(value: object) -> str:
